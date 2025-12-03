@@ -1,0 +1,76 @@
+#!/bin/bash
+
+AOPS_FQDN="vcf-ops-k1-01.vm.cloudidc.intranet.ice"
+
+
+# Ejemplo: TOKEN="8f32fc08-ce6d-40ab-8441-ccc5cbf5d3f7::9c9ea7a7-11e1-4482-853f-8e7e8dab45a7"
+TOKEN="PON_AQUI_EL_TOKEN_COMPLETO"
+
+# AlertDefinitions a filtrar (las mismas que ya usas)
+ALERT_DEFS=(
+  "AlertDefinition-f8a6c9e1-f23a-4831-bf5d-b9071a37f8c3"
+  "AlertDefinition-e6b21908-234b-475c-9244-822046b253d5"
+  "AlertDefinition-b88c91b1-0176-4f96-9e0f-42ce9a631bab"
+)
+
+# Construir JSON del array alertDefinitionId
+ALERT_DEFS_JSON=$(printf '"%s",' "${ALERT_DEFS[@]}" | sed 's/,$//')
+
+# Obtener alertas activas
+ALERTS_JSON=$(curl -sk -X POST \
+  "https://${AOPS_FQDN}/suite-api/api/alerts/query?page=0&pageSize=1000&_no_links=true" \
+  -H "accept: application/json" \
+  -H "Authorization: OpsToken ${TOKEN}" \
+  -H "Content-Type: application/json" \
+  -d "{
+        \"activeOnly\": true,
+        \"alertDefinitionId\": [
+          ${ALERT_DEFS_JSON}
+        ],
+        \"page\": 0,
+        \"pageSize\": 1000
+      }")
+
+# Guardar pageInfo para reutilizarlo en la salida final
+PAGEINFO=$(echo "$ALERTS_JSON" | jq '.pageInfo')
+
+# Si no hay alertas, devolver estructura vacía pero con pageInfo
+if [ "$(echo "$ALERTS_JSON" | jq '.alerts | length')" -eq 0 ]; then
+  echo "{\"pageInfo\": ${PAGEINFO}, \"alerts\": []}"
+  exit 0
+fi
+
+# Cache simple para no repetir llamadas de recursos
+declare -A RESOURCE_CACHE
+
+ENRICHED_ALERTS=""
+
+# Recorrer cada alerta (formato compacto)
+while read -r ALERT_JSON; do
+  RESOURCE_ID=$(echo "$ALERT_JSON" | jq -r '.resourceId')
+
+  # Revisar si ya tenemos ese resourceId en cache
+  if [[ -n "${RESOURCE_CACHE[$RESOURCE_ID]}" ]]; then
+    RESOURCE_NAME="${RESOURCE_CACHE[$RESOURCE_ID]}"
+  else
+    RESOURCE_JSON=$(curl -sk -X GET \
+      "https://${AOPS_FQDN}/suite-api/api/resources/${RESOURCE_ID}" \
+      -H "accept: application/json" \
+      -H "Authorization: OpsToken ${TOKEN}")
+
+    RESOURCE_NAME=$(echo "$RESOURCE_JSON" | jq -r '.resourceKey.name // "N/A"')
+
+    # Guardar en cache
+    RESOURCE_CACHE["$RESOURCE_ID"]="$RESOURCE_NAME"
+  fi
+
+  # Agregar campo resourceName al objeto de la alerta
+  ALERT_WITH_NAME=$(echo "$ALERT_JSON" | jq --arg rn "$RESOURCE_NAME" '. + {resourceName: $rn}')
+
+  ENRICHED_ALERTS+="${ALERT_WITH_NAME}"$'\n'
+done < <(echo "$ALERTS_JSON" | jq -c '.alerts[]?')
+
+# Volver a armar JSON final con pageInfo + alerts enriquecidas
+FINAL_JSON=$(echo "$ENRICHED_ALERTS" | jq -s --argjson pi "$PAGEINFO" '{pageInfo: $pi, alerts: .}')
+
+echo "$FINAL_JSON"
