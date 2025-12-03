@@ -1,76 +1,215 @@
-#!/bin/bash
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 
-AOPS_FQDN="vcf-ops-k1-01.vm.cloudidc.intranet.ice"
+import json
+import ssl
+import sys
+from urllib import request, error, parse
+
+# ==========================
+# CONFIGURACIÓN
+# ==========================
+BASE_URL = "https://vcf-ops-k1-01.vm.cloudidc.intranet.ice"
+
+USERNAME = "user-helix"
+PASSWORD = "H3l1x.@l3Rt.2025!"   # cámbialo si lo modifican
+
+ALERT_DEFINITION_IDS = [
+    "AlertDefinition-f8a6c9e1-f23a-4831-bf5d-b9071a37f8c3",
+    "AlertDefinition-e6b21908-234b-475c-9244-822046b253d5",
+    "AlertDefinition-b88c91b1-0176-4f96-9e0f-42ce9a631bab"
+]
+
+ACTIVE_ONLY = True
+PAGE = 0
+PAGE_SIZE = 1000
+
+# ==========================
+# UTILIDADES HTTP
+# ==========================
+
+# Contexto SSL sin validación de certificado (equivalente a curl -k)
+SSL_CONTEXT = ssl._create_unverified_context()
 
 
-# Ejemplo: TOKEN="8f32fc08-ce6d-40ab-8441-ccc5cbf5d3f7::9c9ea7a7-11e1-4482-853f-8e7e8dab45a7"
-TOKEN="PON_AQUI_EL_TOKEN_COMPLETO"
+def http_post(path, body_dict, headers=None, query_params=None):
+    """
+    Realiza un POST a BASE_URL + path, enviando body_dict como JSON.
+    """
+    if headers is None:
+        headers = {}
 
-# AlertDefinitions a filtrar (las mismas que ya usas)
-ALERT_DEFS=(
-  "AlertDefinition-f8a6c9e1-f23a-4831-bf5d-b9071a37f8c3"
-  "AlertDefinition-e6b21908-234b-475c-9244-822046b253d5"
-  "AlertDefinition-b88c91b1-0176-4f96-9e0f-42ce9a631bab"
-)
+    url = BASE_URL + path
+    if query_params:
+        qs = parse.urlencode(query_params)
+        url = url + "?" + qs
 
-# Construir JSON del array alertDefinitionId
-ALERT_DEFS_JSON=$(printf '"%s",' "${ALERT_DEFS[@]}" | sed 's/,$//')
+    data = json.dumps(body_dict).encode("utf-8")
+    req = request.Request(url, data=data, method="POST")
 
-# Obtener alertas activas
-ALERTS_JSON=$(curl -sk -X POST \
-  "https://${AOPS_FQDN}/suite-api/api/alerts/query?page=0&pageSize=1000&_no_links=true" \
-  -H "accept: application/json" \
-  -H "Authorization: OpsToken ${TOKEN}" \
-  -H "Content-Type: application/json" \
-  -d "{
-        \"activeOnly\": true,
-        \"alertDefinitionId\": [
-          ${ALERT_DEFS_JSON}
-        ],
-        \"page\": 0,
-        \"pageSize\": 1000
-      }")
+    # Headers básicos
+    req.add_header("Content-Type", "application/json")
+    for k, v in headers.items():
+        req.add_header(k, v)
 
-# Guardar pageInfo para reutilizarlo en la salida final
-PAGEINFO=$(echo "$ALERTS_JSON" | jq '.pageInfo')
+    try:
+        with request.urlopen(req, context=SSL_CONTEXT) as resp:
+            resp_data = resp.read().decode("utf-8")
+            if not resp_data:
+                return {}
+            return json.loads(resp_data)
+    except error.HTTPError as e:
+        sys.stderr.write(f"HTTPError POST {url}: {e.code} {e.reason}\n")
+        sys.stderr.write(e.read().decode("utf-8") + "\n")
+        sys.exit(1)
+    except error.URLError as e:
+        sys.stderr.write(f"URLError POST {url}: {e.reason}\n")
+        sys.exit(1)
 
-# Si no hay alertas, devolver estructura vacía pero con pageInfo
-if [ "$(echo "$ALERTS_JSON" | jq '.alerts | length')" -eq 0 ]; then
-  echo "{\"pageInfo\": ${PAGEINFO}, \"alerts\": []}"
-  exit 0
-fi
 
-# Cache simple para no repetir llamadas de recursos
-declare -A RESOURCE_CACHE
+def http_get(path, headers=None):
+    """
+    Realiza un GET a BASE_URL + path.
+    """
+    if headers is None:
+        headers = {}
 
-ENRICHED_ALERTS=""
+    url = BASE_URL + path
+    req = request.Request(url, method="GET")
+    for k, v in headers.items():
+        req.add_header(k, v)
 
-# Recorrer cada alerta (formato compacto)
-while read -r ALERT_JSON; do
-  RESOURCE_ID=$(echo "$ALERT_JSON" | jq -r '.resourceId')
+    try:
+        with request.urlopen(req, context=SSL_CONTEXT) as resp:
+            resp_data = resp.read().decode("utf-8")
+            if not resp_data:
+                return {}
+            return json.loads(resp_data)
+    except error.HTTPError as e:
+        sys.stderr.write(f"HTTPError GET {url}: {e.code} {e.reason}\n")
+        sys.stderr.write(e.read().decode("utf-8") + "\n")
+        sys.exit(1)
+    except error.URLError as e:
+        sys.stderr.write(f"URLError GET {url}: {e.reason}\n")
+        sys.exit(1)
 
-  # Revisar si ya tenemos ese resourceId en cache
-  if [[ -n "${RESOURCE_CACHE[$RESOURCE_ID]}" ]]; then
-    RESOURCE_NAME="${RESOURCE_CACHE[$RESOURCE_ID]}"
-  else
-    RESOURCE_JSON=$(curl -sk -X GET \
-      "https://${AOPS_FQDN}/suite-api/api/resources/${RESOURCE_ID}" \
-      -H "accept: application/json" \
-      -H "Authorization: OpsToken ${TOKEN}")
 
-    RESOURCE_NAME=$(echo "$RESOURCE_JSON" | jq -r '.resourceKey.name // "N/A"')
+# ==========================
+# LÓGICA DE NEGOCIO
+# ==========================
 
-    # Guardar en cache
-    RESOURCE_CACHE["$RESOURCE_ID"]="$RESOURCE_NAME"
-  fi
+def acquire_token():
+    """
+    Llama a /suite-api/api/auth/token/acquire y devuelve el token.
+    """
+    path = "/suite-api/api/auth/token/acquire"
+    body = {
+        "username": USERNAME,
+        "password": PASSWORD
+    }
+    resp = http_post(path, body)
+    token = resp.get("token")
+    if not token:
+        sys.stderr.write("No se pudo obtener el token. Respuesta:\n")
+        sys.stderr.write(json.dumps(resp, indent=2) + "\n")
+        sys.exit(1)
+    return token
 
-  # Agregar campo resourceName al objeto de la alerta
-  ALERT_WITH_NAME=$(echo "$ALERT_JSON" | jq --arg rn "$RESOURCE_NAME" '. + {resourceName: $rn}')
 
-  ENRICHED_ALERTS+="${ALERT_WITH_NAME}"$'\n'
-done < <(echo "$ALERTS_JSON" | jq -c '.alerts[]?')
+def query_alerts(token):
+    """
+    Ejecuta el mismo query que tu curl actual a /alerts/query
+    y devuelve el JSON completo.
+    """
+    path = "/suite-api/api/alerts/query"
+    query_params = {
+        "page": PAGE,
+        "pageSize": PAGE_SIZE,
+        "_no_links": "true"
+    }
+    headers = {
+        "accept": "application/json",
+        "Authorization": f"OpsToken {token}"
+    }
+    body = {
+        "activeOnly": ACTIVE_ONLY,
+        "alertDefinitionId": ALERT_DEFINITION_IDS,
+        "page": PAGE,
+        "pageSize": PAGE_SIZE
+    }
+    return http_post(path, body, headers=headers, query_params=query_params)
 
-# Volver a armar JSON final con pageInfo + alerts enriquecidas
-FINAL_JSON=$(echo "$ENRICHED_ALERTS" | jq -s --argjson pi "$PAGEINFO" '{pageInfo: $pi, alerts: .}')
 
-echo "$FINAL_JSON"
+def get_resource_name(token, resource_id, cache):
+    """
+    Devuelve el nombre del recurso (resourceKey.name) para un resourceId.
+    Usa una caché en memoria para evitar múltiples llamadas al mismo ID.
+    """
+    if resource_id in cache:
+        return cache[resource_id]
+
+    path = f"/suite-api/api/resources/{resource_id}"
+    headers = {
+        "accept": "application/json",
+        "Authorization": f"OpsToken {token}"
+    }
+    resp = http_get(path, headers=headers)
+
+    name = "N/A"
+    try:
+        name = resp.get("resourceKey", {}).get("name", "N/A")
+    except Exception:
+        pass
+
+    cache[resource_id] = name
+    return name
+
+
+def main():
+    # 1) Obtener token
+    token = acquire_token()
+
+    # 2) Consultar alertas
+    alerts_json = query_alerts(token)
+
+    page_info = alerts_json.get("pageInfo", {})
+    alerts = alerts_json.get("alerts", [])
+
+    if not alerts:
+        # Devolver estructura vacía si no hay alertas
+        result = {
+            "pageInfo": page_info,
+            "alerts": []
+        }
+        print(json.dumps(result, indent=2))
+        return
+
+    # 3) Enriquecer cada alerta con resourceName
+    resource_cache = {}
+    enriched_alerts = []
+
+    for alert in alerts:
+        resource_id = alert.get("resourceId")
+        if not resource_id:
+            # Si no tiene resourceId, lo dejamos igual
+            enriched_alerts.append(alert)
+            continue
+
+        resource_name = get_resource_name(token, resource_id, resource_cache)
+
+        # Clonar el dict de la alerta y agregar resourceName
+        new_alert = dict(alert)
+        new_alert["resourceName"] = resource_name
+        enriched_alerts.append(new_alert)
+
+    # 4) Armar JSON final
+    result = {
+        "pageInfo": page_info,
+        "alerts": enriched_alerts
+    }
+
+    print(json.dumps(result, indent=2))
+
+
+if __name__ == "__main__":
+    main()
